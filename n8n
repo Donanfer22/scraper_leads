@@ -1,0 +1,385 @@
+{
+  "name": "SCRAPER DE LEADS",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "scraper",
+        "responseMode": "lastNode",
+        "options": {}
+      },
+      "id": "0b8f1100-9dac-4bf6-be43-a5e8ab98b63f",
+      "name": "Webhook Trigger",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        -224,
+        368
+      ],
+      "webhookId": "a566c3ff-782d-44de-9e52-e9972cb027e4"
+    },
+    {
+      "parameters": {
+        "code": "// Parse simple input like: \"restaurant, cairns\" or \"gym, melbourne\" or \"coffee shop, sydney, 5\"\nconst webhookData = $input.first().json;\n// Extract message from multiple possible formats\nconst userInput = (\n  webhookData.body?.message || \n  webhookData.body?.chatInput || \n  webhookData.body?.body?.chatInput ||  // Handle test data format\n  webhookData.message || \n  webhookData.chatInput ||\n  (Array.isArray(webhookData.body?.body) ? webhookData.body.body[0]?.chatInput : null) ||\n  (Array.isArray(webhookData.body) ? webhookData.body[0]?.chatInput : null) ||\n  (Array.isArray(webhookData) ? webhookData[0]?.chatInput : null) ||\n  ''\n).trim();\n\nif (!userInput) {\n  return { error: 'Please provide input like: restaurant, cairns' };\n}\n\n// Split by comma, semicolon, or pipe - flexible delimiters\nconst parts = userInput.split(/[,;|]/).map(part => part.trim()).filter(part => part.length > 0);\n\nif (parts.length < 2) {\n  return { error: 'Please provide both business type and city. Format: restaurant, cairns' };\n}\n\n// Extract parts\nconst businessType = parts[0];\nconst city = parts[1];\n\n// Optional: extract limit from 3rd part or look for numbers in any part\nlet limit = 50; // default\nlet country = 'au'; // default to Australia\n\n// Check if 3rd part is a number (limit)\nif (parts[2]) {\n  const thirdPart = parts[2].toLowerCase().trim();\n  const numMatch = thirdPart.match(/^(\\\\d+)$/);\n  if (numMatch) {\n    limit = Math.min(Math.max(parseInt(numMatch[1]), 1), 20); // Max 20 to prevent huge responses\n  } else {\n    // If 3rd part isn't a number, maybe it's a country code\n    if (thirdPart.length <= 3) {\n      country = thirdPart;\n    }\n  }\n}\n\n// Check if 4th part exists (could be country if 3rd was limit)\nif (parts[3]) {\n  const fourthPart = parts[3].toLowerCase().trim();\n  if (fourthPart.length <= 3) {\n    country = fourthPart;\n  }\n}\n\n// Also check for numbers anywhere in the input for limit\nconst allText = userInput.toLowerCase();\nconst limitMatch = allText.match(/\\\\b(\\\\d+)\\\\s*(?:results?|leads?|businesses?)\\\\b/);\nif (limitMatch && !parts[2]) {\n  limit = Math.min(Math.max(parseInt(limitMatch[1]), 1), 20); // Max 20\n}\n\n// Check for country codes mentioned anywhere\nconst countryPatterns = {\n  'australia': 'au', 'au': 'au', 'aus': 'au',\n  'usa': 'us', 'us': 'us', 'america': 'us', 'united states': 'us',\n  'canada': 'ca', 'ca': 'ca', 'can': 'ca',\n  'uk': 'gb', 'gb': 'gb', 'united kingdom': 'gb', 'britain': 'gb',\n  'nz': 'nz', 'new zealand': 'nz'\n};\n\nfor (const [pattern, code] of Object.entries(countryPatterns)) {\n  if (allText.includes(pattern) && !parts[2] && !parts[3]) {\n    country = code;\n    break;\n  }\n}\n\nreturn {\n  business_type: businessType,\n  city: city,\n  country: country,\n  limit: limit,\n  original_input: userInput,\n  parsed_parts: parts\n};"
+      },
+      "id": "98e642cb-b26b-4382-ac7d-ff6e0035b8a0",
+      "name": "Input Parser",
+      "type": "@kenkaiii/n8n-nodes-supercode.superCodeNodeVmSafe",
+      "typeVersion": 1,
+      "position": [
+        0,
+        272
+      ]
+    },
+    {
+      "parameters": {
+        "code": "// Get parsed parameters from previous node\nconst params = $input.first().json;\n\n// Handle error case\nif (params.error) {\n  return params;\n}\n\nconst businessType = params.business_type;\nconst city = params.city;\nconst country = params.country;\nconst limit = params.limit;\n\n// Step 1: Geocode the city to get lat/lng\nconst geocodeUrl = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(city)}&format=json&limit=1&countrycodes=${country}`;\n\ntry {\n  const geocodeResponse = await axios.get(geocodeUrl, {\n    headers: { \n      'User-Agent': 'LeadGenerator/1.0',\n      'Accept-Language': 'pt'\n    }\n  });\n\n  if (geocodeResponse.data.length === 0) {\n    return {\n      error: `Could not find location: ${city} in ${country.toUpperCase()}. Try a different city or country code.`,\n      original_input: params.original_input,\n      tried_geocode: geocodeUrl\n    };\n  }\n\n  const location = geocodeResponse.data[0];\n  const lat = parseFloat(location.lat);\n  const lng = parseFloat(location.lon);\n\n  // Step 2: Search for businesses using RapidAPI Maps with STRICT limits\n  const mapsOptions = {\n    method: 'GET',\n    url: 'https://maps-data.p.rapidapi.com/searchmaps.php',\n    params: {\n      query: businessType,\n      limit: Math.min(limit, 50).toString(), // Force maximum 50 results\n      country: country,\n      lang: 'pt',\n      lat: lat.toString(),\n      lng: lng.toString(),\n      offset: '0',\n      zoom: '13'\n    },\n    headers: {\n      'x-rapidapi-key': '95a59a4384mshe5139499bd7402bp1815f2jsn0adae42d7d2e',\n      'x-rapidapi-host': 'maps-data.p.rapidapi.com'\n    }\n  };\n\n  const mapsResponse = await axios.request(mapsOptions);\n  const businesses = mapsResponse.data;\n  \n  // DEBUG: Check response structure\n  if (!businesses || !businesses.data) {\n    return {\n      error: 'Invalid API response structure',\n      debug_info: {\n        has_businesses: !!businesses,\n        businesses_keys: businesses ? Object.keys(businesses) : [],\n        response_type: typeof businesses\n      }\n    };\n  }\n\n  // SAFETY: Limit processing to prevent memory issues\n  const businessData = Array.isArray(businesses.data) ? \n    businesses.data.slice(0, 50) : // Take first 50 only\n    [];\n    \n  if (businessData.length === 0) {\n    return {\n      error: 'No businesses found for this search',\n      search_params: { businessType, city, country, limit },\n      api_response_size: businesses.data ? businesses.data.length : 0\n    };\n  }\n\n  // Step 3: Process results with SMART business opportunities\n  const leads = businessData.map(business => {\n    // Extract postal code based on country\n    let zip_code = null;\n    let state = null;\n    \n    if (business.full_address) {\n      if (country.toLowerCase() === 'au') {\n        const zipMatch = business.full_address.match(/(\\\\d{4})/);\n        zip_code = zipMatch ? zipMatch[1] : null;\n        const stateMatch = business.full_address.match(/\\\\b(VIC|NSW|QLD|WA|SA|TAS|ACT|NT)\\\\b/);\n        state = stateMatch ? stateMatch[1] : null;\n      } else if (country.toLowerCase() === 'us') {\n        const zipMatch = business.full_address.match(/(\\\\d{5}(-\\\\d{4})?)/);\n        zip_code = zipMatch ? zipMatch[1] : null;\n      } else {\n        const zipMatch = business.full_address.match(/(\\\\d{3,6})/);\n        zip_code = zipMatch ? zipMatch[1] : null;\n      }\n    }\n    \n    // Clean website URL\n    let website = business.website;\n    if (website && !website.startsWith('http')) {\n      website = `https://${website}`;\n    }\n    \n    const lead = {\n      business_name: business.name || null,\n      phone: business.phone_number || null,\n      email: null,\n      website: website || null,\n      address: business.full_address || null,\n      city: city,\n      state: state,\n      zip_code: zip_code,\n      country: country,\n      category: (business.types && business.types.length > 0) ? business.types[0] : businessType,\n      business_types: business.types || [businessType],\n      rating: business.rating ? parseFloat(business.rating) : null,\n      review_count: business.review_count || 0,\n      google_place_id: business.business_id || null,\n      latitude: business.latitude || lat,\n      longitude: business.longitude || lng,\n      created_at: dayjs().format('YYYY-MM-DD HH:mm:ss'),\n      lead_source: 'google_maps_api',\n      lead_status: 'new'\n    };\n\n    // Enhanced scoring\n    let score = 0;\n    if (!lead.website) score += 30;\n    if (!lead.phone) score += 25;\n    if (!lead.email) score += 20;\n    if (lead.rating && lead.rating >= 4.0) score += 10;\n    if (lead.review_count < 50) score += 10;\n    if (lead.category && lead.category.toLowerCase().includes(businessType.toLowerCase())) score += 5;\n    \n    lead.lead_score = score;\n    \n    if (score >= 60) lead.priority = 'high';\n    else if (score >= 40) lead.priority = 'medium';\n    else lead.priority = 'low';\n    \n    const qualifiers = [];\n    if (!lead.website) qualifiers.push('no_website');\n    if (!lead.phone) qualifiers.push('no_phone');\n    if (!lead.email) qualifiers.push('no_email');\n    if (lead.rating && lead.rating >= 4.5) qualifiers.push('high_rating');\n    if (lead.review_count < 20) qualifiers.push('low_reviews');\n    if (lead.review_count > 100) qualifiers.push('popular');\n    \n    // Add business type specific qualifiers\n    if (lead.website && (lead.website.includes('facebook') || lead.website.includes('instagram'))) {\n      qualifiers.push('social_only_website');\n    }\n    \n    lead.qualifiers = qualifiers.join(',');\n    \n    // SMART OPPORTUNITIES GENERATION - Based on what they HAVE vs NEED\n    const opportunities = [];\n    \n    // 1. WEBSITE OPPORTUNITIES - Smart logic based on current state\n    if (!lead.website) {\n      // No website = basic web services\n      opportunities.push('Design e desenvolvimento de sites');\n      opportunities.push('Configuração e otimização do Google Meu Negócio');\n      opportunities.push('Pacote básico de SEO');\n    } else if (lead.website.includes('facebook') || lead.website.includes('instagram')) {\n      // Social media as website = professional upgrade\n      opportunities.push('Site profissional para substituir a presença nas redes sociais');\n      opportunities.push('Domínio personalizado e configuração de e-mail profissional');\n      opportunities.push('Brand Atualização da identidade da marca e da presença online');\n    } else {\n      // Has a website = improvement services\n      opportunities.push('Auditoria e otimização de SEO');\n      opportunities.push('Redesenho e modernização do site');\n      opportunities.push('Velocidade do site e otimização para dispositivos móveis');\n      opportunities.push('Otimização da taxa de conversão');\n    }\n    \n    // 2. COMMUNICATION OPPORTUNITIES\n    if (!lead.phone) {\n      opportunities.push('Configuração do sistema telefônico empresarial');\n      opportunities.push('Número de telefone profissional e roteamento de chamadas');\n    }\n    if (!lead.email) {\n      opportunities.push('Configuração e automação de e-mail profissional');\n      opportunities.push('Sistema de gestão de relacionamento com o cliente (CRM)');\n    }\n    \n    // 3. REPUTATION OPPORTUNITIES\n    if (lead.rating && lead.rating < 4.0) {\n      opportunities.push('Gestão de reputação e melhoria de avaliações');\n      opportunities.push('Consultoria para feedback do cliente e melhoria de serviços');\n    } else if (lead.review_count < 50) {\n      opportunities.push('Sistema de geração e gerenciamento de avaliações');\n      opportunities.push('Automação de feedback do cliente');\n    }\n    \n    // 4. BUSINESS TYPE SPECIFIC OPPORTUNITIES - Tailored to industry\n    const businessTypesLower = lead.business_types.map(type => type.toLowerCase());\n    \n    // RESTAURANTS & CAFES\n    if (businessTypesLower.some(type => type.includes('restaurant') || type.includes('cafe') || type.includes('coffee') || type.includes('bar'))) {\n      if (!lead.website) {\n        opportunities.push('Site de restaurante com cardápio online');\n      } else {\n        opportunities.push('Integração do sistema de pedidos online');\n        opportunities.push('Configuração de menu digital e código QR');\n      }\n      opportunities.push('Sistema de reserva de mesas');\n      opportunities.push('Automação de marketing de mídia social');\n    }\n    \n    // FITNESS & GYMS\n    else if (businessTypesLower.some(type => type.includes('gym') || type.includes('fitness') || type.includes('yoga'))) {\n      opportunities.push('Sistema de gerenciamento e faturamento de membros');\n      opportunities.push('Reserva e agendamento de aulas online');\n      opportunities.push('Aplicativo de fitness ou portal de membros');\n      opportunities.push('Sistema de reserva de personal trainer');\n    }\n    \n    // MEDICAL & DENTAL\n    else if (businessTypesLower.some(type => type.includes('dentist') || type.includes('doctor') || type.includes('clinic') || type.includes('medical'))) {\n      opportunities.push('Sistema de agendamento de consultas online');\n      opportunities.push('Sistema de gestão de pacientes');\n      opportunities.push('Lembretes de compromissos automatizados');\n      opportunities.push('Site e formulários compatíveis com HIPAA');\n    }\n    \n    // BEAUTY & SALONS\n    else if (businessTypesLower.some(type => type.includes('salon') || type.includes('spa') || type.includes('beauty') || type.includes('barber'))) {\n      opportunities.push('Sistema de agendamento de consultas online');\n      opportunities.push('Sistema de gerenciamento e histórico de clientes');\n      opportunities.push('Galeria de antes/depois para marketing');\n    }\n    \n    // RETAIL & ECOMMERCE\n    else if (businessTypesLower.some(type => type.includes('shop') || type.includes('store') || type.includes('retail') || type.includes('boutique'))) {\n      if (!lead.website) {\n        opportunities.push('Desenvolvimento de sites de comércio eletrônico');\n      } else {\n        opportunities.push('Integração de funcionalidades de comércio eletrônico');\n        opportunities.push('Otimização de loja online');\n      }\n      opportunities.push('Sistema de gestão de estoque');\n      opportunities.push('Programa de fidelidade do cliente');\n    }\n    \n    // PROFESSIONAL SERVICES\n    else if (businessTypesLower.some(type => type.includes('lawyer') || type.includes('accountant') || type.includes('consultant'))) {\n      if (!lead.website) {\n        opportunities.push('Site de serviços profissionais');\n      } else {\n        opportunities.push('Marketing de conteúdo e configuração de blog');\n        opportunities.push('Páginas de destino de geração de leads');\n      }\n      opportunities.push('Portal do cliente e gerenciamento de documentos');\n      opportunities.push('Agendamento de consulta online');\n    }\n    \n    // Remove duplicates and limit to 8 most relevant\n    lead.business_opportunities = [...new Set(opportunities)].slice(0, 8);\n    \n    // Convert opportunities array to string for Excel compatibility\n    lead.opportunities_text = lead.business_opportunities.join('; ');\n    \n    return lead;\n  }).filter(lead => lead.business_name && lead.business_name.trim() !== '');\n\n  // Sort by lead score\n  leads.sort((a, b) => b.lead_score - a.lead_score);\n\n  return leads;\n  \n} catch (error) {\n  return {\n    error: `Search failed: ${error.message}`,\n    original_input: params.original_input,\n    search_params: {\n      business_type: businessType,\n      city: city,\n      country: country,\n      limit: limit\n    }\n  };\n}"
+      },
+      "id": "90e8f70a-e46e-4e82-a9c1-bdd9a13b4c2f",
+      "name": "Smart Lead Searcher",
+      "type": "@kenkaiii/n8n-nodes-supercode.superCodeNodeVmSafe",
+      "typeVersion": 1,
+      "position": [
+        224,
+        272
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "create",
+        "base": {
+          "__rl": true,
+          "value": "appFS4sKJcfyf6hz9",
+          "mode": "list",
+          "cachedResultName": "$ Make me money",
+          "cachedResultUrl": "https://airtable.com/appFS4sKJcfyf6hz9"
+        },
+        "table": {
+          "__rl": true,
+          "value": "tblRPytVzNseUrCrL",
+          "mode": "list",
+          "cachedResultName": "$$$",
+          "cachedResultUrl": "https://airtable.com/appFS4sKJcfyf6hz9/tblRPytVzNseUrCrL"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "Rating": "={{ $json.rating }}",
+            "Reviews": "={{ $json.review_count }}",
+            "Lead Score": "={{ $json.lead_score }}",
+            "Business Name": "={{ $json.business_name }}",
+            "Number": "={{ $json.phone }}",
+            "Website": "={{ $json.website }}",
+            "Address": "={{ $json.address }}",
+            "City": "={{ $json.city }}",
+            "Category": "={{ $json.category }}",
+            "Opportunities": "={{ $json.opportunities_text }}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "Business Name",
+              "displayName": "Business Name",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Number",
+              "displayName": "Number",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Website",
+              "displayName": "Website",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Address",
+              "displayName": "Address",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "City",
+              "displayName": "City",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Category",
+              "displayName": "Category",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Rating",
+              "displayName": "Rating",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "number",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Reviews",
+              "displayName": "Reviews",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "number",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Lead Score",
+              "displayName": "Lead Score",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "number",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Opportunities",
+              "displayName": "Opportunities",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Attachments",
+              "displayName": "Attachments",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "array",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "Attachment Summary",
+              "displayName": "Attachment Summary",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": true,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.airtable",
+      "typeVersion": 2.1,
+      "position": [
+        448,
+        272
+      ],
+      "id": "a9d84aa4-14a9-4fa7-8db4-9b6f0f62637f",
+      "name": "Create a record",
+      "credentials": {
+        "airtableTokenApi": {
+          "id": "rg662Ba8ByiLs3B5",
+          "name": "Airtable Personal Access Token account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.chatTrigger",
+      "typeVersion": 1.3,
+      "position": [
+        -224,
+        176
+      ],
+      "id": "74e66944-627c-46c2-adb4-2fd0347a9bd3",
+      "name": "When chat message received",
+      "webhookId": "51784d72-e0f0-411d-ba65-28d22a8a3a4b"
+    },
+    {
+      "parameters": {
+        "content": "## SCRAPER LEADS",
+        "height": 464,
+        "width": 1536
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "position": [
+        -880,
+        128
+      ],
+      "typeVersion": 1,
+      "id": "98255041-e0f3-401c-9222-80bd98ffe9c9",
+      "name": "Sticky Note"
+    },
+    {
+      "parameters": {
+        "content": "![Descrição da Imagem](https://media0.giphy.com/media/v1.Y2lkPTc5MGI3NjExbmhvNHE1Y3p5bHFtOHJjZWZnMjg5YjhjMWNhazdmNHBqaW8yZTZiNSZlcD12MV9pbnRlcm5hbF9naWZfYnlfaWQmY3Q9Zw/TytHun5lKuMdzUYVxl/giphy.gif)\n\n\n\n\n\n\n#   [ Inscreva-se Agora!](https://www.youtube.com/@Tutor.I.A)\n\n\n",
+        "height": 500,
+        "width": 340,
+        "color": 7
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        3184,
+        1216
+      ],
+      "id": "79a9be69-7938-4f5f-b574-66dfd4127c85",
+      "name": "Sticky Note9"
+    },
+    {
+      "parameters": {
+        "content": "# \n### \n![Descrição da Imagem](https://media3.giphy.com/media/v1.Y2lkPTc5MGI3NjExcHRob2U3MzVzbDN5c2E5c3h4Z2RjbTI1ZjNwYmV3eWduaGRpNmw4byZlcD12MV9pbnRlcm5hbF9naWZfYnlfaWQmY3Q9Zw/kz6cm1kKle2MYkHtJF/giphy.gif)\n# \n",
+        "height": 324,
+        "width": 520,
+        "color": 7
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        2512,
+        1232
+      ],
+      "id": "a9789bb9-7ed5-48fe-ad93-bb229e44a8c3",
+      "name": "Sticky Note10"
+    },
+    {
+      "parameters": {
+        "content": "# Recuse Imitações!\n![Descrição da Imagem](https://media4.giphy.com/media/v1.Y2lkPTc5MGI3NjExbDQ5bGQ1M3gxdHl2enAzdHo3a2F1YzQydTh5cnIwd3ZnMG50dTZhdCZlcD12MV9pbnRlcm5hbF9naWZfYnlfaWQmY3Q9Zw/tJqyalvo9ahykfykAj/giphy.gif)    \n\n\n\n",
+        "height": 360,
+        "width": 500,
+        "color": 6
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        1920,
+        1232
+      ],
+      "id": "ebffc51c-ae75-4bb8-bf9e-b97e98df41e5",
+      "name": "Sticky Note12"
+    },
+    {
+      "parameters": {
+        "content": "![Scraper](https://www.tree-learning.fr/wp-content/uploads/2024/04/browseai.png)                         ",
+        "height": 352,
+        "width": 544,
+        "color": 7
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -848,
+        192
+      ],
+      "id": "4f28a406-426d-4bdc-99ae-942eadc0080e",
+      "name": "Sticky Note2"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Webhook Trigger": {
+      "main": [
+        [
+          {
+            "node": "Input Parser",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Input Parser": {
+      "main": [
+        [
+          {
+            "node": "Smart Lead Searcher",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Smart Lead Searcher": {
+      "main": [
+        [
+          {
+            "node": "Create a record",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "When chat message received": {
+      "main": [
+        [
+          {
+            "node": "Input Parser",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "1f360f91-c60b-4f65-a3e0-946eacf0a8aa",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "51ec8b13dcbf144ca4f84c354a83778b0deb1106e3615dc3e4f21105dfa59e92"
+  },
+  "id": "m8jZObPQ7ZtqjtK8",
+  "tags": []
+}
